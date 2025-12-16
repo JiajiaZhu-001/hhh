@@ -1,0 +1,276 @@
+import scanpy as sc
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import anndata as ad
+from pathlib import Path
+import os
+import harmonypy
+import warnings
+import scrublet as scr 
+# 忽略警告
+warnings.filterwarnings('ignore')
+# 设置输出目录
+output_dir = Path('../results')
+output_dir.mkdir(exist_ok=True)
+# 1. 读取样本列表
+samples_df = pd.read_excel("DATA/metadata/patients_metadata.xlsx", usecols="A")
+samples = samples_df['sample_id'].tolist()
+
+# 2. 导入cellranger文件并创建AnnData对象
+adatas = []
+for i, sample in enumerate(samples, 1):
+    data_dir = f"DATA/cellranger/{sample}/filtered_feature_bc_matrix"
+    if os.path.exists(data_dir):
+        # 读取10X Genomics数据
+        adata = sc.read_10x_mtx(
+            data_dir,  # 目录路径
+            var_names='gene_symbols',  # 使用基因符号作为变量名
+            cache=True  # 缓存以提高读取速度
+        )
+        # 添加样本ID和细胞barcode前缀（防止barcode冲突）
+        adata.obs_names = [f"{sample}_{bc}" for bc in adata.obs_names]
+        adata.obs['sample_id'] = sample
+        adata.obs['orig.ident'] = sample
+        adatas.append(adata)
+    else:
+        print(f"警告: 路径不存在 {data_dir}")
+# 3. 合并所有数据集
+if adatas:
+    # 合并所有AnnData对象
+    merged_adata = ad.concat(
+    adatas,  # 直接传入要合并的AnnData对象列表
+    join='outer',
+    label="sample.ident", # 可选：新增一列标记样本来源
+    keys=samples
+)
+   print(f"合并前样本数: {len(adatas)}")
+   print(f"合并后形状: {merged_adata.shape}") 
+
+# 4. 计算质量控制指标
+    # 线粒体基因
+    merged_adata.var['mt'] = merged_adata.var_names.str.startswith('MT-')
+    # 血红蛋白基因
+    merged_adata.var['hb'] = merged_adata.var_names.str.startswith(('HBA', 'HBB'))
+    # 核糖体基因
+    merged_adata.var['ribo'] = merged_adata.var_names.str.startswith(('RPS', 'RPL'))
+    
+    # 计算百分比
+    sc.pp.calculate_qc_metrics(
+        merged_adata, 
+        qc_vars=['mt', 'hb', 'ribo'],
+        percent_top=None, 
+        log1p=False, 
+        inplace=True
+    )
+    
+    
+    # 5. 绘制质量控制图
+    qc_params = [
+        'n_genes_by_counts',  # （检测到的基因数）
+        'total_counts',       # （总表达量）
+        'pct_counts_mt',      # （线粒体基因占比）
+        'pct_counts_hb',      # （血红蛋白基因占比）
+        'pct_counts_ribo'     # （核糖体基因占比）
+    ]
+    
+    # 绘制小提琴图(按样本分组)
+    for param in qc_params:
+        plt.figure(figsize=(12, 6))
+        sns.violinplot(data=merged_adata.obs, x='orig.ident', y=param)
+        plt.title(f'{param} - 按样本分组（预过滤）')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+    
+    # 绘制山脊图 (Ridge plots)
+    try:
+        import joypy
+        for param in qc_params:
+            plt.figure(figsize=(12, 8))
+            joypy.joyplot(
+                data=merged_adata.obs, 
+                by='orig.ident', 
+                column=param,
+                figsize=(10, 8)
+            )
+            plt.title(f'{param} - 山脊图')
+            plt.show()
+    except ImportError:
+        print("请安装joypy库来绘制山脊图: pip install joypy")
+        # 如果没有joypy，使用密度图替代
+        for param in qc_params:
+            plt.figure(figsize=(12, 8))
+            for sample in merged_adata.obs['orig.ident'].unique():
+                subset = merged_adata.obs[merged_adata.obs['orig.ident'] == sample][param]
+                sns.kdeplot(subset, label=sample, fill=True, alpha=0.5)
+            plt.title(f'{param} - 密度图')
+            plt.legend()
+            plt.show()
+    
+    # 绘制特定的三个参数的小提琴图
+    fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+    
+    params_to_plot = ['n_genes_by_counts', 'total_counts', 'pct_counts_mt']
+    for i, param in enumerate(params_to_plot):
+        sns.violinplot(
+            data=merged_adata.obs, 
+            x='orig.ident', 
+            y=param,
+            ax=axes[i]
+        )
+        axes[i].set_title(f'{param}（预过滤）')
+        axes[i].tick_params(axis='x', rotation=45)
+        if param in ['n_genes_by_counts', 'total_counts']:
+            axes[i].set_yscale('log')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "SuppFig1B.pdf", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 6. 可选：保存合并的数据
+    merged_adata.write(output_dir / "merged_lung_data.h5ad")
+    
+    print("数据处理完成！")
+    print(f"合并后的数据形状: {merged_adata.shape}")
+    print(f"样本数量: {len(merged_adata.obs['orig.ident'].unique())}")
+    
+else:
+    print("错误: 没有找到任何有效数据")
+#6. 定义QC阈值（静态阈值）
+n_feature_lower = 500 # 每个细胞的最小基因数（建议：200–500）
+n_feature_upper = 7500 # 每个细胞的最大基因数（建议：5000–10000）
+n_count_lower = 1000 # 每个细胞的最小UMI计数（建议：500–1000）
+n_count_upper = 75000 # 每个细胞的最大UMI计数（建议：100000–200000）
+p_mt_upper = 15 # 线粒体基因占比上限（建议：10–15%）
+p_hb_upper = 1 # 血红蛋白基因占比上限（建议：<1%，非血液样本）
+p_ribo_upper = 30 # 核糖体基因占比上限（建议：30–50%）
+#7. 基础过滤：移除基因数过少或表达细胞书过少的基因
+sc.pp.filter_cells(merged_adata, min_genes=n_feature_lower) # 保留至少有500基因的细胞
+sc.pp.filter_genes(merged_adata, min_cells=3) # 基因在至少3个细胞中表达
+#8. 【关键！】先跑Scrublet（在任何阈值过滤前！）
+print("正在运行Scrublet doublet检测（按样本分别计算）...")
+sc.pp.scrublet(
+    merged_adata,
+    batch_key='orig.ident', # 每个样本单独模拟
+    expected_doublet_rate=0.06, # 根据实际装样数调整（8000细胞左右）
+    threshold=None, # 自动阈值
+    random_state=0,
+    verbose=True
+)
+#9. 可视化doublet_score分布（非常重要！）
+plt.figure(figsize=(10, 4))
+sns.histplot(data=merged_adata.obs,
+             x='doublet_score',
+             hue='orig.ident',
+             bins=50,
+             alpha=0.6,
+             palette='tab20',
+             linewidth=0)
+plt.axvline(
+    merged_adata.obs['doublet_score'][merged_adata.obs['predicted_doublet']].min(),
+    color='red', linestyle='--', linewidth=2,
+    label='Scrublet actual threshold'
+)
+plt.title('Doublet Score Distribution (per sample)')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+output_dir = Path("../results")
+plt.savefig(output_dir / "doublet_score_distribution.pdf", dpi=300, bbox_inches='tight')
+plt.show()
+#10. 打印每个样本的双细胞率
+print("各样本预测doublet比例：")
+print(merged_adata.obs.groupby('orig.ident')['predicted_doublet'].mean().round(4))
+#11. 创建一个综合的过滤条件（更高效，只需索引一次）
+print("开始应用QC阈值过滤...")
+filter_condition = (
+    (merged_adata.obs['n_genes_by_counts'] >= n_feature_lower) & # 基因数下限
+    (merged_adata.obs['n_genes_by_counts'] <= n_feature_upper) & # 基因数上限
+    (merged_adata.obs['total_counts'] >= n_count_lower) & # UMI计数下限
+    (merged_adata.obs['total_counts'] <= n_count_upper) & # UMI计数上限
+    (merged_adata.obs['pct_counts_mt'] <= p_mt_upper) & # 线粒体占比上限
+    (~merged_adata.obs['predicted_doublet'])
+)
+# 添加hb过滤（如果存在这些列）
+if 'pct_counts_hb' in merged_adata.obs.columns:
+    filter_condition &= (merged_adata.obs['pct_counts_hb'] <= p_hb_upper)
+   
+#12. 应用过滤条件
+pre_n = merged_adata.n_obs
+merged_adata = merged_adata[filter_condition].copy()
+post_n = merged_adata.n_obs
+#13. 打印过滤统计信息
+print(f"过滤前细胞数: {pre_n}")
+print(f"过滤后细胞数: {post_n}")
+print(f"移除比例: {100*(pre_n-post_n)/pre_n:.2f}%")
+#14. 过滤后重新计算QC指标并绘制验证图
+sc.pp.calculate_qc_metrics(
+    merged_adata,
+    qc_vars=['mt', 'hb', 'ribo'] if 'hb' in merged_adata.var.columns and 'ribo' in merged_adata.var.columns else ['mt'],
+    percent_top=None,
+    log1p=False,
+    inplace=True
+)
+#15. 小提琴图（过滤后，按样本分组）
+qc_params = ['n_genes_by_counts', 'total_counts', 'pct_counts_mt']
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+for i, param in enumerate(qc_params):
+    sns.violinplot(data=merged_adata.obs, x='orig.ident', y=param, ax=axes[i], inner=None, linewidth=1)
+    axes[i].set_title(param, fontsize=14)
+    axes[i].tick_params(axis='x', rotation=45)
+    if param != 'pct_counts_mt':
+        axes[i].set_yscale('log')
+plt.tight_layout()
+plt.savefig(output_dir / "02_final_QC_violin.pdf", dpi=300, bbox_inches='tight')
+plt.show()
+#16. 保存过滤后的数据
+output_dir = Path("../results")
+merged_adata.write(output_dir / "filtered_lung_data.h5ad")
+#16. 可选：归一化（为下游分析准备）
+sc.pp.normalize_total(merged_adata, target_sum=1e4)
+sc.pp.log1p(merged_adata)
+merged_adata.raw = merged_adata  # 保存原始计数
+#17. 高变基因 + PCA + UMAP + 聚类（完整下游分析）
+# ================================
+print("\nStep 4: 开始下游分析（标准化 → HVG → PCA → UMAP → Leiden）")
+
+# 保存原始计数
+merged_adata.raw = merged_adata
+
+# 标准化 & 对数化
+sc.pp.normalize_total(merged_adata, target_sum=1e4)
+sc.pp.log1p(merged_adata)
+
+# 高变基因
+sc.pp.highly_variable_genes(merged_adata, n_top_genes=3000, flavor='seurat_v3')
+print(f"高变基因数: {merged_adata.var['highly_variable'].sum():,}")
+
+# PCA + 邻居图 + UMAP + Leiden 聚类
+sc.pp.pca(merged_adata, n_comps=50, use_highly_variable=True)
+sc.pp.neighbors(merged_adata, n_pcs=40)
+sc.tl.umap(merged_adata)
+sc.tl.tsne(merged_adata)  # 可选，t-SNE较慢
+sc.tl.leiden(merged_adata, resolution=0.8)  # 肺组织常用 0.6~1.0
+import harmonypy
+sc.pp.pca(merged_adata)  # 先计算PCA
+hoe = harmonypy.run_harmony(merged_adata.obsm['X_pca'], merged_adata.obs, 'sample_id')  # 'sample_id'是批次列
+merged_adata.obsm['X_pca_harmony'] = hoe.Z_corr.T  # 保存校正后的PCA
+# PCA（主成分分析）
+sc.pp.pca(merged_adata, n_comps=50)  # 或使用校正后的PCA
+
+# 计算邻域图
+sc.pp.neighbors(merged_adata, n_neighbors=10, n_pcs=40)  # 基于PCA的前40维
+
+# UMAP和t-SNE
+sc.tl.umap(merged_adata)
+sc.tl.tsne(merged_adata)  # 可选，t-SNE较慢
+
+# 可视化
+sc.pl.umap(merged_adata, color=['sample_id'], title='UMAP by Sample')
+plt.savefig(output_dir / "umap_sample.pdf")
+# Leiden聚类（推荐，优于Louvain）
+sc.tl.leiden(merged_adata, resolution=0.5)  # 调整resolution控制簇数
+
+# 可视化聚类结果
+sc.pl.umap(merged_adata, color='leiden', title='UMAP with Clusters')
+plt.savefig(output_dir / "umap_clusters.pdf")
